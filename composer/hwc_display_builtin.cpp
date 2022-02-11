@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+* Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -27,18 +27,15 @@
 * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include <android-base/file.h>
 #include <cutils/properties.h>
-#include <cutils/sockets.h>
+#include <sync/sync.h>
 #include <utils/constants.h>
 #include <utils/debug.h>
 #include <utils/utils.h>
 #include <stdarg.h>
-#include <sync/sync.h>
 #include <sys/mman.h>
 
 #include <map>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -55,77 +52,6 @@ static void SetRect(LayerRect &src_rect, GLRect *target) {
   target->top = src_rect.top;
   target->right = src_rect.right;
   target->bottom = src_rect.bottom;
-}
-
-static std::string LoadPanelGammaCalibration() {
-  constexpr char file[] = "/mnt/vendor/persist/display/gamma_calib_data.cal";
-  std::ifstream ifs(file);
-
-  if (!ifs.is_open()) {
-    DLOGW("Unable to open gamma calibration '%s', error = %s", file, strerror(errno));
-    return {};
-  }
-
-  std::string raw_data, gamma;
-  while (std::getline(ifs, raw_data, '\r')) {
-    gamma.append(raw_data.c_str());
-    gamma.append(" ");
-    std::getline(ifs, raw_data);
-  }
-  ifs.close();
-
-  /* eliminate space character in the last byte */
-  if (!gamma.empty()) {
-    gamma.pop_back();
-  }
-
-  return gamma;
-}
-
-static DisplayError WritePanelGammaTableToDriver(const std::string &gamma_data) {
-  constexpr char gamma_path[] = "/sys/devices/platform/soc/soc:qcom,dsi-display-primary/gamma";
-  int fd = open(gamma_path, O_WRONLY);
-  if (fd < 0) {
-    DLOGW("Unable to open gamma node '%s', error = %s", gamma_path, strerror(errno));
-    return kErrorFileDescriptor;
-  }
-
-  constexpr int max_retries = 5;
-  ssize_t len;
-  int retry_count = 0;
-  DisplayError error = kErrorNone;
-  while ((len = pwrite(fd, gamma_data.c_str(), gamma_data.size(), 0)) != gamma_data.size()) {
-    if ((len == -1 && errno != EINTR && errno != EAGAIN) || (++retry_count > max_retries)) {
-      DLOGE("Failed to write gamma calibration(retry %d), error = %s", retry_count,
-            strerror(errno));
-      break;
-    }
-  }
-  close(fd);
-
-  if (len != gamma_data.size()) {
-    error = kErrorResources;
-  }
-
-  return error;
-}
-
-static DisplayError UpdatePanelGammaTable(enum HWCDisplay::PanelGammaSource source) {
-  std::string gamma_data = {};
-  DisplayError error;
-  if (source == HWCDisplay::kGammaDefault) {
-    gamma_data = "default";
-  } else if (source == HWCDisplay::kGammaCalibration) {
-    gamma_data = LoadPanelGammaCalibration();
-  }
-
-  if (!gamma_data.empty()) {
-    error = WritePanelGammaTableToDriver(gamma_data);
-  } else {
-    error = kErrorParameters;
-  }
-
-  return error;
 }
 
 int HWCDisplayBuiltIn::Create(CoreInterface *core_intf, BufferAllocator *buffer_allocator,
@@ -201,9 +127,9 @@ int HWCDisplayBuiltIn::Init() {
   color_mode_ = new HWCColorMode(display_intf_);
   color_mode_->Init();
 
-  int optimize_refresh = 0;
-  HWCDebugHandler::Get()->GetProperty(ENABLE_OPTIMIZE_REFRESH, &optimize_refresh);
-  enable_optimize_refresh_ = (optimize_refresh == 1);
+  int value = 0;
+  HWCDebugHandler::Get()->GetProperty(ENABLE_OPTIMIZE_REFRESH, &value);
+  enable_optimize_refresh_ = (value == 1);
   if (enable_optimize_refresh_) {
     DLOGI("Drop redundant drawcycles %" PRIu64 , id_);
   }
@@ -227,7 +153,18 @@ int HWCDisplayBuiltIn::Init() {
                       &window_rect_.right, &window_rect_.bottom) != kErrorUndefined;
     DLOGI("Window rect : [%f %f %f %f]", window_rect_.left, window_rect_.top,
           window_rect_.right, window_rect_.bottom);
+
+    value = 0;
+    HWCDebugHandler::Get()->GetProperty(ENABLE_POMS_DURING_DOZE, &value);
+    enable_poms_during_doze_ = (value == 1);
+    if (enable_poms_during_doze_) {
+      DLOGI("Enable POMS during Doze mode %" PRIu64 , id_);
+    }
   }
+
+  value = 0;
+  DebugHandler::Get()->GetProperty(DISABLE_DYNAMIC_FPS, &value);
+  disable_dyn_fps_ = (value == 1);
 
   uint32_t config_index = 0;
   GetActiveDisplayConfig(&config_index);
@@ -237,6 +174,15 @@ int HWCDisplayBuiltIn::Init() {
 
   DLOGI("active_refresh_rate: %d", active_refresh_rate_);
 
+  int enhance_idle_time = 0;
+  HWCDebugHandler::Get()->GetProperty(ENHANCE_IDLE_TIME, &enhance_idle_time);
+  enhance_idle_time_ = (enhance_idle_time == 1);
+  DLOGI("enhance_idle_time: %d", enhance_idle_time);
+
+  HWCDebugHandler::Get()->GetProperty(PERF_HINT_WINDOW_PROP, &perf_hint_window_);
+  HWCDebugHandler::Get()->GetProperty(ENABLE_PERF_HINT_LARGE_COMP_CYCLE,
+                                      &perf_hint_large_comp_cycle_);
+
   return status;
 }
 
@@ -245,13 +191,29 @@ void HWCDisplayBuiltIn::Dump(std::ostringstream *os) {
   *os << histogram.Dump();
 }
 
+void HWCDisplayBuiltIn::ValidateUiScaling() {
+  if (is_primary_ || !is_cmd_mode_) {
+    force_reset_validate_ = false;
+    return;
+  }
+
+  for (auto &hwc_layer : layer_set_) {
+    Layer *layer = hwc_layer->GetSDMLayer();
+    if (hwc_layer->IsScalingPresent() && !layer->input_buffer.flags.video) {
+      force_reset_validate_ = true;
+      return;
+    }
+  }
+  force_reset_validate_ = false;
+}
+
 HWC2::Error HWCDisplayBuiltIn::Validate(uint32_t *out_num_types, uint32_t *out_num_requests) {
   auto status = HWC2::Error::None;
   DisplayError error = kErrorNone;
 
   DTRACE_SCOPED();
 
-  if (display_paused_ || (!is_primary_ && active_secure_sessions_[kSecureDisplay])) {
+  if (display_paused_) {
     MarkLayersForGPUBypass();
     return status;
   }
@@ -263,6 +225,9 @@ HWC2::Error HWCDisplayBuiltIn::Validate(uint32_t *out_num_types, uint32_t *out_n
 
   // Fill in the remaining blanks in the layers and add them to the SDM layerstack
   BuildLayerStack();
+
+  // Check for scaling layers during Doze mode
+  ValidateUiScaling();
 
   // Add stitch layer to layer stack.
   AppendStitchLayer();
@@ -297,14 +262,16 @@ HWC2::Error HWCDisplayBuiltIn::Validate(uint32_t *out_num_types, uint32_t *out_n
   }
 
   uint32_t refresh_rate = GetOptimalRefreshRate(one_updating_layer);
-  error = display_intf_->SetRefreshRate(refresh_rate, force_refresh_rate_);
+  bool idle_screen = GetUpdatingAppLayersCount() == 0;
+  error = display_intf_->SetRefreshRate(refresh_rate, force_refresh_rate_, idle_screen);
 
   // Get the refresh rate set.
   display_intf_->GetRefreshRate(&refresh_rate);
   bool vsync_source = (callbacks_->GetVsyncSource() == id_);
 
   if (error == kErrorNone) {
-    if (vsync_source && (current_refresh_rate_ < refresh_rate)) {
+    if (vsync_source && ((current_refresh_rate_ < refresh_rate) ||
+                         (enhance_idle_time_ && (current_refresh_rate_ != refresh_rate)))) {
       DTRACE_BEGIN("HWC2::Vsync::Enable");
       // Display is ramping up from idle.
       // Client realizes need for resync upon change in config.
@@ -325,6 +292,7 @@ HWC2::Error HWCDisplayBuiltIn::Validate(uint32_t *out_num_types, uint32_t *out_n
   }
 
   status = PrepareLayerStack(out_num_types, out_num_requests);
+  SetCpuPerfHintLargeCompCycle();
   pending_commit_ = true;
   return status;
 }
@@ -367,29 +335,36 @@ HWC2::Error HWCDisplayBuiltIn::CommitStitchLayers() {
     return HWC2::Error::None;
   }
 
+  LayerStitchContext ctx = {};
+  Layer *stitch_layer = stitch_target_->GetSDMLayer();
+  LayerBuffer &output_buffer = stitch_layer->input_buffer;
   for (auto &layer : layer_stack_.layers) {
     LayerComposition &composition = layer->composition;
     if (composition != kCompositionStitch) {
       continue;
     }
 
-    LayerStitchContext ctx = {};
+    StitchParams params = {};
     // Stitch target doesn't have an input fence.
     // Render all layers at specified destination.
     LayerBuffer &input_buffer = layer->input_buffer;
-    ctx.src_hnd = reinterpret_cast<const private_handle_t *>(input_buffer.buffer_id);
-    Layer *stitch_layer = stitch_target_->GetSDMLayer();
-    LayerBuffer &output_buffer = stitch_layer->input_buffer;
-    ctx.dst_hnd = reinterpret_cast<const private_handle_t *>(output_buffer.buffer_id);
-    SetRect(layer->stitch_info.dst_rect, &ctx.dst_rect);
-    SetRect(layer->stitch_info.slice_rect, &ctx.scissor_rect);
-    ctx.src_acquire_fence = input_buffer.acquire_fence;
+    params.src_hnd = reinterpret_cast<const private_handle_t *>(input_buffer.buffer_id);
+    params.dst_hnd = reinterpret_cast<const private_handle_t *>(output_buffer.buffer_id);
+    SetRect(layer->stitch_info.dst_rect, &params.dst_rect);
+    SetRect(layer->stitch_info.slice_rect, &params.scissor_rect);
+    params.src_acquire_fence = input_buffer.acquire_fence;
 
-    layer_stitch_task_.PerformTask(LayerStitchTaskCode::kCodeStitch, &ctx);
-
-    // Merge with current fence.
-    output_buffer.acquire_fence = Fence::Merge(output_buffer.acquire_fence, ctx.release_fence);
+    ctx.stitch_params.push_back(params);
   }
+
+  if (!ctx.stitch_params.size()) {
+    // No layers marked for stitch.
+    return HWC2::Error::None;
+  }
+
+  layer_stitch_task_.PerformTask(LayerStitchTaskCode::kCodeStitch, &ctx);
+  // Set release fence.
+  output_buffer.acquire_fence = ctx.release_fence;
 
   return HWC2::Error::None;
 }
@@ -509,9 +484,7 @@ HWC2::Error HWCDisplayBuiltIn::Present(shared_ptr<Fence> *out_retire_fence) {
 
   DTRACE_SCOPED();
 
-  if (!is_primary_ && active_secure_sessions_[kSecureDisplay]) {
-    return status;
-  } else if (display_paused_) {
+  if (display_paused_) {
     DisplayError error = display_intf_->Flush(&layer_stack_);
     validated_ = false;
     if (error != kErrorNone) {
@@ -540,30 +513,25 @@ HWC2::Error HWCDisplayBuiltIn::Present(shared_ptr<Fence> *out_retire_fence) {
       if (is_cmd_mode_ != command_mode) {
         SetPartialUpdate(fixed_info);
       }
-    }
-  }
 
-  if (CC_UNLIKELY(!has_config_hbm_threshold_)) {
-    uint32_t panel_x, panel_y;
-    GetPanelResolution(&panel_x, &panel_y);
-    hbm_threshold_px_ = float(panel_x * panel_y) * hbm_threshold_pct_;
-    DLOGI("Configure hbm_threshold_px_ to %f", hbm_threshold_px_);
-
-    has_config_hbm_threshold_ = true;
-  }
-
-  const bool enable_hbm(hdr_largest_layer_px_ > hbm_threshold_px_);
-  if (high_brightness_mode_ != enable_hbm) {
-    HbmState state = enable_hbm ? HbmState::HDR : HbmState::OFF;
-    auto status = SetHbm(state, HWC);
-    if (status == HWC2::Error::None) {
-      high_brightness_mode_ = enable_hbm;
-    } else {
-      DLOGE("failed to setHbm to %d", enable_hbm);
+      // For video mode panel with dynamic fps, update the active mode index.
+      // This is needed to report the correct Vsync period when client queries
+      // using GetDisplayVsyncPeriod API.
+      if (!is_cmd_mode_ && !disable_dyn_fps_) {
+        hwc2_config_t active_config = hwc_config_map_.at(0);
+        GetActiveConfig(&active_config);
+        SetActiveConfigIndex(active_config);
+      }
     }
   }
 
   pending_commit_ = false;
+
+  // In case of scaling UI layer for command mode, reset validate
+  if (force_reset_validate_) {
+    validated_ = false;
+    display_intf_->ClearLUTs();
+  }
   return status;
 }
 
@@ -888,7 +856,7 @@ void HWCDisplayBuiltIn::SetQDCMSolidFillInfo(bool enable, const LayerSolidFill &
 }
 
 void HWCDisplayBuiltIn::ToggleCPUHint(bool set) {
-  if (!cpu_hint_) {
+  if (!cpu_hint_ || !perf_hint_window_) {
     return;
   }
 
@@ -900,13 +868,16 @@ void HWCDisplayBuiltIn::ToggleCPUHint(bool set) {
 }
 
 int HWCDisplayBuiltIn::HandleSecureSession(const std::bitset<kSecureMax> &secure_sessions,
-                                           bool *power_on_pending) {
+                                           bool *power_on_pending, bool is_active_secure_display) {
   if (!power_on_pending) {
     return -EINVAL;
   }
 
-  if (!is_primary_) {
-    return HWCDisplay::HandleSecureSession(secure_sessions, power_on_pending);
+  if (!is_active_secure_display) {
+    // Do handling as done on non-primary displays.
+    DLOGI("Default handling for display %" PRIu64 " %d-%d", id_, sdm_id_, type_);
+    return HWCDisplay::HandleSecureSession(secure_sessions, power_on_pending,
+                                           is_active_secure_display);
   }
 
   if (current_power_mode_ != HWC2::PowerMode::On) {
@@ -922,9 +893,9 @@ int HWCDisplayBuiltIn::HandleSecureSession(const std::bitset<kSecureMax> &secure
       return err;
     }
 
-    DLOGI("SecureDisplay state changed from %d to %d for display %" PRIu64 "-%d",
+    DLOGI("SecureDisplay state changed from %d to %d for display %" PRIu64 " %d-%d",
           active_secure_sessions_.test(kSecureDisplay), secure_sessions.test(kSecureDisplay),
-          id_, type_);
+          id_, sdm_id_, type_);
   }
   active_secure_sessions_ = secure_sessions;
   *power_on_pending = false;
@@ -956,8 +927,8 @@ uint32_t HWCDisplayBuiltIn::GetOptimalRefreshRate(bool one_updating_layer) {
   return active_refresh_rate_;
 }
 
-void HWCDisplayBuiltIn::SetIdleTimeoutMs(uint32_t timeout_ms) {
-  display_intf_->SetIdleTimeoutMs(timeout_ms);
+void HWCDisplayBuiltIn::SetIdleTimeoutMs(uint32_t timeout_ms, uint32_t inactive_ms) {
+  display_intf_->SetIdleTimeoutMs(timeout_ms, inactive_ms);
   validated_ = false;
 }
 
@@ -1268,6 +1239,29 @@ DisplayError HWCDisplayBuiltIn::GetSupportedDSIClock(std::vector<uint64_t> *bitc
   return kErrorNotSupported;
 }
 
+DisplayError HWCDisplayBuiltIn::SetStandByMode(bool enable) {
+  if (enable) {
+    if (!display_null_.IsActive()) {
+      stored_display_intf_ = display_intf_;
+      display_intf_ = &display_null_;
+      display_null_.SetActive(true);
+      DLOGD("Null display is connected successfully");
+    } else {
+      DLOGD("Null display is already connected.");
+    }
+  } else {
+    if (display_null_.IsActive()) {
+      display_intf_ = stored_display_intf_;
+      validated_ = false;
+      display_null_.SetActive(false);
+      DLOGD("Display is connected successfully");
+    } else {
+      DLOGD("Display is already connected.");
+    }
+  }
+  return kErrorNone;
+}
+
 HWC2::Error HWCDisplayBuiltIn::UpdateDisplayId(hwc2_display_t id) {
   id_ = id;
   return HWC2::Error::None;
@@ -1303,15 +1297,6 @@ HWC2::Error HWCDisplayBuiltIn::GetPanelMaxBrightness(uint32_t *max_brightness_le
   }
 
   return HWC2::Error::None;
-}
-
-DisplayError HWCDisplayBuiltIn::SetCurrentPanelGammaSource(enum PanelGammaSource source) {
-  DisplayError error = UpdatePanelGammaTable(source);
-  if (error == kErrorNone) {
-    current_panel_gamma_source_ = source;
-  }
-
-  return error;
 }
 
 HWC2::Error HWCDisplayBuiltIn::SetBLScale(uint32_t level) {
@@ -1367,6 +1352,12 @@ bool HWCDisplayBuiltIn::IsSmartPanelConfig(uint32_t config_id) {
 }
 
 bool HWCDisplayBuiltIn::HasSmartPanelConfig(void) {
+  if (!enable_poms_during_doze_) {
+    uint32_t config = 0;
+    GetActiveDisplayConfig(&config);
+    return IsSmartPanelConfig(config);
+  }
+
   for (auto &config : variable_config_map_) {
     if (config.second.smart_panel) {
       return true;
@@ -1396,9 +1387,7 @@ void HWCDisplayBuiltIn::OnTask(const LayerStitchTaskCode &task_code,
     case LayerStitchTaskCode::kCodeStitch: {
         DTRACE_SCOPED();
         LayerStitchContext* ctx = reinterpret_cast<LayerStitchContext*>(task_context);
-        gl_layer_stitch_->Blit(ctx->src_hnd, ctx->dst_hnd, ctx->src_rect, ctx->dst_rect,
-                               ctx->scissor_rect, ctx->src_acquire_fence,
-                               ctx->dst_acquire_fence, &(ctx->release_fence));
+        gl_layer_stitch_->Blit(ctx->stitch_params, &(ctx->release_fence));
       }
       break;
     case LayerStitchTaskCode::kCodeDestroyInstance: {
@@ -1539,73 +1528,43 @@ bool HWCDisplayBuiltIn::HasReadBackBufferSupport() {
   return fixed_info.readback_supported;
 }
 
-HWC2::Error HWCDisplayBuiltIn::ApplyHbmLocked() {
-  if (!mHasHbmNode)
-    return HWC2::Error::Unsupported;
+uint32_t HWCDisplayBuiltIn::GetUpdatingAppLayersCount() {
+  uint32_t updating_count = 0;
 
-  HbmState state = HbmState::OFF;
-  for (auto req : mHbmSates) {
-    if (req == HbmState::SUNLIGHT) {
-      state = HbmState::SUNLIGHT;
+  for (uint i = 0; i < layer_stack_.layers.size(); i++) {
+    auto layer = layer_stack_.layers.at(i);
+    if (layer->composition == kCompositionGPUTarget) {
       break;
-    } else if (req == HbmState::HDR) {
-      state = HbmState::HDR;
+    }
+    if (layer->flags.updating) {
+      updating_count++;
     }
   }
 
-  if (state == mCurHbmState)
-    return HWC2::Error::None;
-
-  std::string action = std::to_string(static_cast<int>(state));
-  if (!android::base::WriteStringToFile(action, kHighBrightnessModeNode)) {
-    DLOGE("Failed to write hbm node = %s, error = %s ", kHighBrightnessModeNode, strerror(errno));
-  } else {
-    DLOGI("write %s to HBM sysfs file succeeded", action.c_str());
-  }
-
-  mCurHbmState = state;
-
-  return HWC2::Error::None;
+  return updating_count;
 }
 
-bool HWCDisplayBuiltIn::IsHbmSupported() {
-  if (!mHasHbmNode)
-    return false;
-
-  bool is_hbm_supported = false;
-  std::string buffer;
-  if (!android::base::ReadFileToString(kHighBrightnessModeNode, &buffer)) {
-    DLOGE("Failed to read hbm node = %s, error = %s ", kHighBrightnessModeNode, strerror(errno));
-  } else if (buffer == "unsupported") {
-    DLOGI("kernel driver does not support hbm");
-  } else {
-    is_hbm_supported = true;
-  }
-
-  return is_hbm_supported;
+bool HWCDisplayBuiltIn::IsDisplayIdle() {
+  // Notify only if this display is source of vsync.
+  bool vsync_source = (callbacks_->GetVsyncSource() == id_);
+  return vsync_source && display_idle_;
 }
 
-HWC2::Error HWCDisplayBuiltIn::SetHbm(HbmState state, HbmClient client) {
-  auto status = HWC2::Error::None;
-  if (client >= CLIENT_MAX)
-    return HWC2::Error::BadParameter;
-
-  std::unique_lock<decltype(hbm_mutex)> lk(hbm_mutex);
-
-  /* save and apply the request state */
-  if (mHbmSates[client] != state) {
-    mHbmSates[client] = state;
-
-    status = ApplyHbmLocked();
-    if (INT32(status) != HWC2_ERROR_NONE)
-      DLOGE("Failed to apply hbm node, error = %d", status);
+void HWCDisplayBuiltIn::SetCpuPerfHintLargeCompCycle() {
+  if (!cpu_hint_ || !perf_hint_large_comp_cycle_) {
+    DLOGV_IF(kTagResources, "cpu_hint_ not initialized or property not set");
+    return;
   }
 
-  return status;
-}
-
-HbmState HWCDisplayBuiltIn::GetHbm() {
-  return mCurHbmState;
+  for (auto hwc_layer : layer_set_) {
+    Layer *layer = hwc_layer->GetSDMLayer();
+    if (layer->composition == kCompositionGPU) {
+      DLOGV_IF(kTagResources, "Set perf hint for large comp cycle");
+      int hwc_tid = gettid();
+      cpu_hint_->ReqHintsOffload(kPerfHintLargeCompCycle, hwc_tid);
+      break;
+    }
+  }
 }
 
 }  // namespace sdm

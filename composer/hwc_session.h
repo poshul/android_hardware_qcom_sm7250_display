@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -25,6 +25,7 @@
 
 #include <core/core_interface.h>
 #include <utils/locker.h>
+#include <utils/constants.h>
 #include <qd_utils.h>
 #include <display_config.h>
 #include <vector>
@@ -51,10 +52,13 @@
 using ::android::hardware::Return;
 using ::android::hardware::hidl_string;
 using android::hardware::hidl_handle;
+using ::android::hardware::hidl_vec;
 using ::android::sp;
 using ::android::hardware::Void;
 namespace composer_V2_4 = ::android::hardware::graphics::composer::V2_4;
+namespace composer_V2_3 = ::android::hardware::graphics::composer::V2_3;
 using HwcDisplayCapability = composer_V2_4::IComposerClient::DisplayCapability;
+using HwcDisplayCapability_2_3 = composer_V2_3::IComposerClient::DisplayCapability;
 using HwcDisplayConnectionType = composer_V2_4::IComposerClient::DisplayConnectionType;
 
 namespace sdm {
@@ -63,6 +67,9 @@ using vendor::qti::hardware::display::composer::V3_0::IQtiComposerClient;
 int32_t GetDataspaceFromColorMode(ColorMode mode);
 
 typedef DisplayConfig::DisplayType DispType;
+#ifdef DISPLAY_CONFIG_CAMERA_SMOOTH_APIs_1_0
+typedef DisplayConfig::CameraSmoothOp CameraSmoothOp;
+#endif
 
 // Create a singleton uevent listener thread valid for life of hardware composer process.
 // This thread blocks on uevents poll inside uevent library implementation. This poll exits
@@ -194,10 +201,6 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
   uint32_t GetMaxVirtualDisplayCount();
   int32_t GetDisplayIdentificationData(hwc2_display_t display, uint8_t *outPort,
                                        uint32_t *outDataSize, uint8_t *outData);
-  int32_t GetDisplayCapabilities(hwc2_display_t display, uint32_t *outNumCapabilities,
-                                 uint32_t *capabilities);
-  int32_t GetDisplayCapabilities_2_4(hwc2_display_t display, uint32_t *outNumCapabilities,
-                                     uint32_t *capabilities);
   int32_t GetDisplayCapabilities(hwc2_display_t display,
                                  hidl_vec<HwcDisplayCapability> *capabilities);
   int32_t GetDisplayCapabilities2_3(hwc2_display_t display,
@@ -294,23 +297,11 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
       const VsyncPeriodChangeConstraints *vsync_period_change_constraints,
       VsyncPeriodChangeTimeline *out_timeline);
 
-  int32_t SetAutoLowLatencyMode(hwc2_display_t display, bool on);
-  int32_t GetSupportedContentTypes(hwc2_display_t display, hidl_vec<HwcContentType> *types);
-  int32_t SetContentType(hwc2_display_t display, HwcContentType type);
-
   static Locker locker_[HWCCallbacks::kNumDisplays];
   static Locker power_state_[HWCCallbacks::kNumDisplays];
   static Locker hdr_locker_[HWCCallbacks::kNumDisplays];
   static Locker display_config_locker_;
-
-  void RegisterDisplayCallback();
-  bool IsHbmSupported();
-  void SetHbmState(HbmState state);
-  HbmState GetHbmState();
-  bool IsLbeSupported();
-  void SetLbeState(LbeState state);
-  void SetLbeAmbientLight(int value);
-  LbeState GetLbeState();
+  static Locker system_locker_;
 
  private:
   class CWB {
@@ -398,6 +389,13 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
     virtual int IsSmartPanelConfig(uint32_t disp_id, uint32_t config_id, bool *is_smart);
     virtual int IsRotatorSupportedFormat(int hal_format, bool ubwc, bool *supported);
     virtual int ControlQsyncCallback(bool enable);
+    virtual int ControlIdleStatusCallback(bool enable);
+#ifdef DISPLAY_CONFIG_CAMERA_SMOOTH_APIs_1_0
+    virtual int SetCameraSmoothInfo(CameraSmoothOp op, uint32_t fps);
+    virtual int ControlCameraSmoothCallback(bool enable);
+#endif
+    virtual int IsRCSupported(uint32_t disp_id, bool *supported);
+    virtual int AllowIdleFallback();
 
     std::weak_ptr<DisplayConfig::ConfigCallback> callback_;
     HWCSession *hwc_session_ = nullptr;
@@ -490,10 +488,9 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
   android::status_t SetColorModeById(const android::Parcel *input_parcel);
   android::status_t SetColorModeFromClient(const android::Parcel *input_parcel);
   android::status_t getComposerStatus();
+  android::status_t SetStandByMode(const android::Parcel *input_parcel);
   android::status_t SetQSyncMode(const android::Parcel *input_parcel);
   android::status_t SetIdlePC(const android::Parcel *input_parcel);
-  android::status_t SetDisplayDeviceStatus(const android::Parcel *input_parcel);
-  android::status_t SetPanelGammaTableSource(const android::Parcel *input_parcel);
   android::status_t RefreshScreen(const android::Parcel *input_parcel);
   android::status_t SetAd4RoiConfig(const android::Parcel *input_parcel);
   android::status_t SetDsiClk(const android::Parcel *input_parcel);
@@ -518,8 +515,7 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
   int32_t GetVirtualDisplayId();
   void PerformQsyncCallback(hwc2_display_t display);
   bool isSmartPanelConfig(uint32_t disp_id, uint32_t config_id);
-
-  int SendLTMCommand(const char *cmd);
+  void PerformIdleStatusCallback(hwc2_display_t display);
 
   CoreInterface *core_intf_ = nullptr;
   HWCDisplay *hwc_display_[HWCCallbacks::kNumDisplays] = {nullptr};
@@ -561,23 +557,17 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
   std::bitset<HWCCallbacks::kNumDisplays> pending_refresh_;
   CWB cwb_;
   std::weak_ptr<DisplayConfig::ConfigCallback> qsync_callback_;
+  std::weak_ptr<DisplayConfig::ConfigCallback> idle_callback_;
+#ifdef DISPLAY_CONFIG_CAMERA_SMOOTH_APIs_1_0
+  std::weak_ptr<DisplayConfig::ConfigCallback> camera_callback_;
+#endif
   bool async_powermode_ = false;
+  bool async_power_mode_triggered_ = false;
   bool async_vds_creation_ = false;
   bool power_state_transition_[HWCCallbacks::kNumDisplays] = {};
   std::bitset<HWCCallbacks::kNumDisplays> display_ready_;
   bool secure_session_active_ = false;
-
-  int32_t is_lbe_supported_ = 0;
-  LbeState lbe_cur_state_ = LbeState::OFF;
-  int pps_socket_ = -1;
-  int8_t pps_retry = 5;
-  static constexpr const char *ltm_on_cmd_ = "Ltm:On:Primary:Auto";
-  static constexpr const char *ltm_off_cmd_ = "Ltm:Off:Primary";
-  static constexpr const char *ltm_lux_cmd_ = "Ltm:Als:Primary:";
-  static constexpr const char *ltm_default_mode_cmd_ = "Ltm:UserMode:Primary:default";
-  static constexpr const char *ltm_hbm_mode_cmd_ = "Ltm:UserMode:Primary:hbm";
-  static constexpr const char *ltm_power_save_mode_cmd_ = "Ltm:UserMode:Primary:power_save";
-  static constexpr const char *ltm_get_mode_cmd_ = "Ltm:GetUserMode:Primary";
+  bool is_idle_time_up_ = false;
 };
 }  // namespace sdm
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -21,7 +21,6 @@
 #define __HWC_DISPLAY_H__
 
 #include <QService.h>
-#include <aidl/com/google/hardware/pixel/display/BnDisplay.h>
 #include <android/hardware/graphics/common/1.2/types.h>
 #include <core/core_interface.h>
 #include <hardware/hwcomposer.h>
@@ -44,19 +43,15 @@
 #include "hwc_layers.h"
 #include "hwc_buffer_sync_handler.h"
 
-using android::hardware::hidl_vec;
+using android::hardware::graphics::common::V1_2::ColorMode;
 using android::hardware::graphics::common::V1_1::Dataspace;
 using android::hardware::graphics::common::V1_1::RenderIntent;
-using android::hardware::graphics::common::V1_2::ColorMode;
 using android::hardware::graphics::common::V1_2::Hdr;
 namespace composer_V2_4 = ::android::hardware::graphics::composer::V2_4;
 using HwcAttribute = composer_V2_4::IComposerClient::Attribute;
 using VsyncPeriodChangeConstraints = composer_V2_4::IComposerClient::VsyncPeriodChangeConstraints;
 using VsyncPeriodChangeTimeline = composer_V2_4::VsyncPeriodChangeTimeline;
 using VsyncPeriodNanos = composer_V2_4::VsyncPeriodNanos;
-using HwcContentType = composer_V2_4::IComposerClient::ContentType;
-using HbmState = ::aidl::com::google::hardware::pixel::display::HbmState;
-using LbeState = ::aidl::com::google::hardware::pixel::display::LbeState;
 
 namespace sdm {
 
@@ -161,17 +156,6 @@ class HWCDisplay : public DisplayEventHandler {
     kSkipValidate,
   };
 
-  enum PanelGammaSource {
-    kGammaDefault,      // Resotre gamma table to default
-    kGammaCalibration,  // Update gamma table from calibration file
-  };
-
-  enum HbmClient {
-    HWC = 0,
-    APP,
-    CLIENT_MAX,
-  };
-
   struct HWCLayerStack {
     HWCLayer *client_target = nullptr;                   // Also known as framebuffer target
     std::map<hwc2_layer_t, HWCLayer *> layer_map;        // Look up by Id - TODO
@@ -183,7 +167,7 @@ class HWCDisplay : public DisplayEventHandler {
   virtual int Deinit();
 
   // Framebuffer configurations
-  virtual void SetIdleTimeoutMs(uint32_t timeout_ms);
+  virtual void SetIdleTimeoutMs(uint32_t timeout_ms, uint32_t inactive_ms);
   virtual HWC2::Error SetFrameDumpConfig(uint32_t count, uint32_t bit_mask_layer_type,
                                          int32_t format, bool post_processed);
   virtual DisplayError SetMaxMixerStages(uint32_t max_mixer_stages);
@@ -197,13 +181,11 @@ class HWCDisplay : public DisplayEventHandler {
   virtual int OnMinHdcpEncryptionLevelChange(uint32_t min_enc_level);
   virtual int Perform(uint32_t operation, ...);
   virtual int HandleSecureSession(const std::bitset<kSecureMax> &secure_sessions,
-                                  bool *power_on_pending);
+                                  bool *power_on_pending, bool is_active_secure_display);
   virtual int GetActiveSecureSession(std::bitset<kSecureMax> *secure_sessions);
   virtual DisplayError SetMixerResolution(uint32_t width, uint32_t height);
   virtual DisplayError GetMixerResolution(uint32_t *width, uint32_t *height);
   virtual void GetPanelResolution(uint32_t *width, uint32_t *height);
-  virtual DisplayError SetCurrentPanelGammaSource(enum PanelGammaSource /*source*/) { return kErrorNotSupported; }
-  virtual PanelGammaSource GetCurrentPanelGammaSource() const { return kGammaDefault; };
   virtual void Dump(std::ostringstream *os);
   virtual DisplayError TeardownConcurrentWriteback(void) {
     return kErrorNotSupported;
@@ -250,6 +232,10 @@ class HWCDisplay : public DisplayEventHandler {
     return false;
   }
 
+  virtual bool VsyncEnablePending() {
+    return false;
+  }
+
   // Display Configurations
   static uint32_t GetThrottlingRefreshRate() { return HWCDisplay::throttling_refresh_rate_; }
   static void SetThrottlingRefreshRate(uint32_t newRefreshRate)
@@ -260,6 +246,9 @@ class HWCDisplay : public DisplayEventHandler {
   virtual int GetDisplayAttributesForConfig(int config,
                                             DisplayConfigVariableInfo *display_attributes);
   virtual int SetState(bool connected) {
+    return kErrorNotSupported;
+  }
+  virtual DisplayError SetStandByMode(bool enable) {
     return kErrorNotSupported;
   }
   virtual DisplayError Flush() {
@@ -304,6 +293,8 @@ class HWCDisplay : public DisplayEventHandler {
     return HWC2::Error::Unsupported;
   }
   virtual HWC2::Error SetClientTarget(buffer_handle_t target, shared_ptr<Fence> acquire_fence,
+                                      int32_t dataspace, hwc_region_t damage);
+  virtual HWC2::Error GetClientTarget(buffer_handle_t target, shared_ptr<Fence> acquire_fence,
                                       int32_t dataspace, hwc_region_t damage);
   virtual HWC2::Error SetColorMode(ColorMode mode) { return HWC2::Error::Unsupported; }
   virtual HWC2::Error SetColorModeWithRenderIntent(ColorMode mode, RenderIntent intent) {
@@ -405,6 +396,9 @@ class HWCDisplay : public DisplayEventHandler {
   virtual HWC2::PowerMode GetPendingPowerMode() {
     return pending_power_mode_;
   }
+  virtual void SetPendingPowerMode(HWC2::PowerMode mode) {
+    pending_power_mode_ = mode;
+  }
   virtual void ClearPendingPowerMode() {
     pending_power_mode_ = current_power_mode_;
   }
@@ -426,19 +420,18 @@ class HWCDisplay : public DisplayEventHandler {
       uint64_t *samples[NUM_HISTOGRAM_COLOR_COMPONENTS]);
 
   virtual HWC2::Error GetDisplayVsyncPeriod(VsyncPeriodNanos *vsync_period);
+  virtual HWC2::Error SetDisplayVsyncPeriod(VsyncPeriodNanos vsync_period) {
+    return HWC2::Error::None;
+  }
+
+
   virtual HWC2::Error SetActiveConfigWithConstraints(
       hwc2_config_t config, const VsyncPeriodChangeConstraints *vsync_period_change_constraints,
       VsyncPeriodChangeTimeline *out_timeline);
-  virtual HWC2::Error SetAutoLowLatencyMode(bool on) { return HWC2::Error::Unsupported; }
-  virtual HWC2::Error GetSupportedContentTypes(hidl_vec<HwcContentType> *types);
-  virtual HWC2::Error SetContentType(HwcContentType type);
 
   HWC2::Error SetDisplayElapseTime(uint64_t time);
   virtual bool HasReadBackBufferSupport() { return false; }
-
-  virtual bool IsHbmSupported() { return false; }
-  virtual HWC2::Error SetHbm(HbmState state, HbmClient client) { return HWC2::Error::None; }
-  virtual HbmState GetHbm() { return HbmState::OFF; }
+  virtual bool IsDisplayIdle() { return false; };
 
  protected:
   static uint32_t throttling_refresh_rate_;
@@ -488,6 +481,9 @@ class HWCDisplay : public DisplayEventHandler {
   bool AllowSeamless(hwc2_config_t request_config);
   void SetVsyncsApplyRateChange(uint32_t vsyncs) { vsyncs_to_apply_rate_change_ = vsyncs; }
   HWC2::Error SubmitDisplayConfig(hwc2_config_t config);
+  HWC2::Error GetCachedActiveConfig(hwc2_config_t *config);
+  void SetActiveConfigIndex(int active_config_index);
+  int GetActiveConfigIndex();
 
   bool validated_ = false;
   bool layer_stack_invalid_ = true;
@@ -549,10 +545,17 @@ class HWCDisplay : public DisplayEventHandler {
   int64_t pending_refresh_rate_applied_time_ = INT64_MAX;
   std::deque<TransientRefreshRateInfo> transient_refresh_rate_info_;
   std::mutex transient_refresh_rate_lock_;
-  float hdr_largest_layer_px_ = 0.0f;
+  std::mutex active_config_lock_;
+  int active_config_index_ = -1;
   LayerRect window_rect_ = {};
   bool windowed_display_ = false;
   uint32_t active_refresh_rate_ = 0;
+  bool animating_ = false;
+  buffer_handle_t client_target_handle_ = 0;
+  shared_ptr<Fence> client_acquire_fence_ = nullptr;
+  int32_t client_dataspace_ = 0;
+  hwc_region_t client_damage_region_ = {};
+  bool display_idle_ = false;
 
  private:
   void DumpInputBuffers(void);
@@ -564,7 +567,6 @@ class HWCDisplay : public DisplayEventHandler {
   DisplayClass display_class_;
   uint32_t geometry_changes_ = GeometryChanges::kNone;
   uint32_t geometry_changes_on_doze_suspend_ = GeometryChanges::kNone;
-  bool animating_ = false;
   int null_display_mode_ = 0;
   DisplayValidateState validate_state_ = kNormalValidate;
   bool fast_path_enabled_ = true;
@@ -572,6 +574,8 @@ class HWCDisplay : public DisplayEventHandler {
   shared_ptr<Fence> fbt_release_fence_ = nullptr;
   shared_ptr<Fence> release_fence_ = nullptr;
   hwc2_config_t pending_config_index_ = 0;
+  bool pending_first_commit_config_ = false;
+  hwc2_config_t pending_first_commit_config_index_ = 0;
   bool game_supported_ = false;
   uint64_t elapse_timestamp_ = 0;
   int async_power_mode_ = 0;
